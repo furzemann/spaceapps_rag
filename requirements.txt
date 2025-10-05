@@ -1,0 +1,11 @@
+streamlit
+psycopg2-binary
+sentence-transformers
+langchain-huggingface
+langchain-core
+langchain
+numpy
+pathlib
+requests
+pandas
+beautifulsoup4
