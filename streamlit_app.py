@@ -23,7 +23,7 @@ st.set_page_config(
 )
 
 # Database Configuration
-NEON_CONNECTION_STRING = "postgresql://neondb_owner:npg_cZJvwbxs23YS@ep-flat-term-a1bhljd0-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require"
+NEON_CONNECTION_STRING = "YOUR_DATABASE_URL"
 EXISTING_TABLE_NAME = "paper_chunks"
 TEXT_COLUMN_NAME = "chunk_text"
 ID_COLUMN_NAME = "id"
@@ -468,3 +468,4 @@ else:
 # Footer
 st.markdown("---")
 st.markdown("Built with Streamlit, LangChain and pgvector 🚀")
+
