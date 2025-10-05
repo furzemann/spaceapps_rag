@@ -1,9 +1,19 @@
 import streamlit as st
 import os
-from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace, HuggingFaceEmbeddings
-from sklearn.metrics.pairwise import cosine_similarity
-from langchain_core.prompts import PromptTemplate
+import psycopg2
+from psycopg2.extras import execute_values, Json
+from psycopg2.extensions import register_adapter
+import hashlib
+from sentence_transformers import SentenceTransformer
+from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain.schema import Document
 import numpy as np
+from pathlib import Path
+from collections import deque
+
+# Register dict to JSON adapter globally
+register_adapter(dict, Json)
 
 # Set page config
 st.set_page_config(
@@ -12,6 +22,12 @@ st.set_page_config(
     layout="wide"
 )
 
+# Database Configuration
+NEON_CONNECTION_STRING = "postgresql://neondb_owner:npg_cZJvwbxs23YS@ep-flat-term-a1bhljd0-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require"
+EXISTING_TABLE_NAME = "paper_chunks"
+TEXT_COLUMN_NAME = "chunk_text"
+ID_COLUMN_NAME = "id"
+
 # Initialize session state
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -19,22 +35,296 @@ if "messages" not in st.session_state:
 if "rag_initialized" not in st.session_state:
     st.session_state.rag_initialized = False
 
+if "vector_store" not in st.session_state:
+    st.session_state.vector_store = None
+
+class NeonVectorStore:
+    """Persistent vector store using Neon PostgreSQL with pgvector"""
+
+    def __init__(self, connection_string, embedding_model, source_table=None, text_column=None, id_column=None):
+        """Initialize vector store with database connection"""
+        self.connection_string = connection_string
+        self.embedding_model = embedding_model
+        self.source_table = source_table
+        self.text_column = text_column
+        self.id_column = id_column
+
+        # Establish database connection
+        self.conn = psycopg2.connect(connection_string)
+        
+        # Enable pgvector extension and create tables
+        self._enable_pgvector()
+        self._create_embeddings_table()
+
+    def _enable_pgvector(self):
+        """Enable pgvector extension in the database"""
+        with self.conn.cursor() as cur:
+            cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            self.conn.commit()
+
+    def _create_embeddings_table(self):
+        """Create embeddings table if it doesn't exist"""
+        embedding_dim = self.embedding_model.get_sentence_embedding_dimension()
+
+        create_table_sql = f"""
+        CREATE TABLE IF NOT EXISTS document_embeddings (
+            id SERIAL PRIMARY KEY,
+            source_id TEXT,
+            content_hash TEXT UNIQUE,
+            page_content TEXT NOT NULL,
+            metadata JSONB DEFAULT '{{}}'::jsonb,
+            embedding vector({embedding_dim}),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+
+        with self.conn.cursor() as cur:
+            cur.execute(create_table_sql)
+            self.conn.commit()
+
+    def _generate_content_hash(self, content):
+        """Generate SHA256 hash for content deduplication"""
+        return hashlib.sha256(content.encode('utf-8')).hexdigest()
+
+    def fetch_strings_from_existing_database(self, limit=None):
+        """Fetch existing strings from your Neon PostgreSQL database"""
+        if not self.source_table or not self.text_column:
+            raise ValueError("source_table and text_column must be specified")
+
+        with self.conn.cursor() as cur:
+            query = f"""
+                SELECT {self.id_column}, {self.text_column}
+                FROM {self.source_table}
+                WHERE {self.text_column} IS NOT NULL
+                AND LENGTH(TRIM({self.text_column})) > 0
+            """
+
+            if limit:
+                query += f" LIMIT {limit}"
+
+            cur.execute(query)
+            results = cur.fetchall()
+
+        return results
+
+    def check_if_exists(self, content_hash):
+        """Check if document already has embeddings"""
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT EXISTS(SELECT 1 FROM document_embeddings WHERE content_hash = %s)",
+                (content_hash,)
+            )
+            return cur.fetchone()[0]
+
+    def convert_strings_to_embeddings(self, batch_size=50):
+        """Convert strings from database to embeddings"""
+        string_data = self.fetch_strings_from_existing_database()
+
+        if not string_data:
+            return 0
+
+        total_strings = len(string_data)
+        new_embeddings = 0
+        skipped = 0
+
+        for batch_start in range(0, total_strings, batch_size):
+            batch_end = min(batch_start + batch_size, total_strings)
+            batch = string_data[batch_start:batch_end]
+
+            batch_values = []
+
+            for source_id, text_content in batch:
+                content_hash = self._generate_content_hash(text_content)
+
+                if self.check_if_exists(content_hash):
+                    skipped += 1
+                    continue
+
+                embedding = self.embedding_model.encode(text_content).tolist()
+
+                batch_values.append((
+                    str(source_id),
+                    content_hash,
+                    text_content,
+                    Json({}),
+                    embedding
+                ))
+
+            if batch_values:
+                with self.conn.cursor() as cur:
+                    execute_values(
+                        cur,
+                        """
+                        INSERT INTO document_embeddings
+                        (source_id, content_hash, page_content, metadata, embedding)
+                        VALUES %s
+                        ON CONFLICT (content_hash) DO NOTHING
+                        """,
+                        batch_values,
+                        template="(%s, %s, %s, %s, %s::vector)"
+                    )
+                    self.conn.commit()
+
+                new_embeddings += len(batch_values)
+
+        return new_embeddings
+
+    def get_document_count(self):
+        """Get total number of embeddings in database"""
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM document_embeddings")
+            return cur.fetchone()[0]
+
+    def create_index(self, index_type="hnsw", distance_metric="cosine"):
+        """Create vector index for faster similarity search"""
+        metric_ops = {
+            "cosine": "vector_cosine_ops",
+            "l2": "vector_l2_ops",
+            "ip": "vector_ip_ops"
+        }
+
+        ops = metric_ops.get(distance_metric, "vector_cosine_ops")
+        index_name = "document_embeddings_embedding_idx"
+
+        with self.conn.cursor() as cur:
+            cur.execute(f"DROP INDEX IF EXISTS {index_name}")
+            self.conn.commit()
+
+        if index_type == "hnsw":
+            create_index_sql = f"""
+            CREATE INDEX {index_name}
+            ON document_embeddings
+            USING hnsw (embedding {ops})
+            WITH (m = 16, ef_construction = 64)
+            """
+        else:
+            create_index_sql = f"""
+            CREATE INDEX {index_name}
+            ON document_embeddings
+            USING ivfflat (embedding {ops})
+            WITH (lists = 100)
+            """
+
+        with self.conn.cursor() as cur:
+            cur.execute(create_index_sql)
+            self.conn.commit()
+
+    def similarity_search(self, query, k=4):
+        """Perform similarity search using cosine distance"""
+        query_embedding = self.embedding_model.encode(query).tolist()
+
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, page_content, metadata,
+                       1 - (embedding <=> %s::vector) AS similarity
+                FROM document_embeddings
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+            """, (query_embedding, query_embedding, k))
+
+            results = cur.fetchall()
+            return [Document(page_content=row[1], metadata=row[2] or {}) for row in results]
+
+    def mmr_search(self, query, k=4, lambda_mult=0.5, fetch_k=20):
+        """Maximal Marginal Relevance search for diversity"""
+        query_embedding = self.embedding_model.encode(query).tolist()
+
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, page_content, metadata, embedding,
+                       1 - (embedding <=> %s::vector) AS similarity
+                FROM document_embeddings
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+            """, (query_embedding, query_embedding, fetch_k))
+
+            candidates = cur.fetchall()
+
+        if not candidates:
+            return []
+
+        selected_indices = []
+        candidate_embeddings = np.array([c[3] for c in candidates])
+        query_emb = np.array(query_embedding)
+
+        selected_indices.append(0)
+
+        while len(selected_indices) < k and len(selected_indices) < len(candidates):
+            best_score = -float('inf')
+            best_idx = -1
+
+            for i in range(len(candidates)):
+                if i in selected_indices:
+                    continue
+
+                relevance = 1 - np.linalg.norm(query_emb - candidate_embeddings[i])
+                diversity = min([
+                    1 - np.linalg.norm(candidate_embeddings[i] - candidate_embeddings[j])
+                    for j in selected_indices
+                ])
+
+                mmr_score = lambda_mult * relevance + (1 - lambda_mult) * diversity
+
+                if mmr_score > best_score:
+                    best_score = mmr_score
+                    best_idx = i
+
+            if best_idx != -1:
+                selected_indices.append(best_idx)
+
+        return [Document(page_content=candidates[i][1], metadata=candidates[i][2] or {})
+                for i in selected_indices]
+
+    def close(self):
+        """Close database connection"""
+        if self.conn:
+            self.conn.close()
+
 # Sidebar configuration
 with st.sidebar:
     st.title("⚙️ Configuration")
     
     hf_token = st.text_input("Hugging Face Token", type="password", key="hf_token")
     
-    style = st.selectbox("Response Style", ["fun", "formal", "casual"], index=0)
-    level = st.selectbox("User Level", ["student", "researcher", "expert"], index=0)
-    max_token = st.slider("Max Tokens", 20, 200, 50)
+    style = st.selectbox("Response Style", ["simple", "detailed", "technical"], index=0)
+    level = st.selectbox("User Level", ["General", "Researcher"], index=0)
+    max_token = st.slider("Max Tokens", 50, 1000, 512)
     temperature = st.slider("Temperature", 0.0, 1.0, 0.1)
+    search_k = st.slider("Search Results", 1, 10, 2)
+    lambda_mult = st.slider("MMR Lambda (Diversity)", 0.0, 1.0, 0.5)
     
     if st.button("Initialize RAG System"):
         if hf_token:
             os.environ["HUGGINGFACEHUB_API_TOKEN"] = hf_token
-            st.session_state.rag_initialized = True
-            st.success("RAG System Initialized!")
+            
+            with st.spinner("Loading embedding model..."):
+                try:
+                    embedding_model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
+                    
+                    vector_store = NeonVectorStore(
+                        connection_string=NEON_CONNECTION_STRING,
+                        embedding_model=embedding_model,
+                        source_table=EXISTING_TABLE_NAME,
+                        text_column=TEXT_COLUMN_NAME,
+                        id_column=ID_COLUMN_NAME
+                    )
+                    
+                    existing_count = vector_store.get_document_count()
+                    
+                    if existing_count == 0:
+                        st.info("Converting text chunks to embeddings...")
+                        new_count = vector_store.convert_strings_to_embeddings(batch_size=50)
+                        if new_count > 0:
+                            vector_store.create_index(index_type="hnsw", distance_metric="cosine")
+                            st.success(f"Created {new_count} embeddings and index!")
+                    else:
+                        st.success(f"Using existing {existing_count} embeddings")
+                    
+                    st.session_state.vector_store = vector_store
+                    st.session_state.rag_initialized = True
+                    
+                except Exception as e:
+                    st.error(f"Error initializing RAG system: {str(e)}")
         else:
             st.error("Please enter your Hugging Face token")
 
@@ -42,85 +332,82 @@ with st.sidebar:
 st.title("🧬 Biology RAG Chatbot")
 st.markdown("Ask questions about space biology experiments!")
 
-# Initialize RAG components
-@st.cache_resource
-def initialize_rag():
-    # Text data
-    text = [
-        "After a 16-year hiatus, Russia resumed in 2013 its program of biomedical research in space, with the successful 30-day flight of the Bion-M 1 biosatellite (April 19–May 19, 2013), a specially designed automated spacecraft dedicated to life-science experiments. 'M' in the mission's name stands for 'modernized'; the epithet was equally applicable to the spacecraft and the research program. The principal animal species for physiological studies in this mission was the mouse (Mus musculus). Unlike more recent space experiments that used female mice, males were flown in the Bion-M 1 mission. The challenging task of supporting mice in space for this unmanned, automated, 30-day-long mission, was made even more so by the requirement to house the males in groups.",
-        
-        "Russian biomedical research in space traditionally has employed dogs, rats, monkeys, and more recently Mongolian gerbils. The flight of Laika in 1957 was one of the early dog experiments and became world famous for demonstrating that a living organism can withstand rocket launch and weightlessness, thus paving the way for the first human spaceflight. Laika's success also promoted biomedical research with other non-human animals in space that culminated with the Bion biosatellites program. A total of 212 rats and 12 monkeys were launched on 11 satellites and exposed in microgravity for 5.0–22.5 days between 1973 and 1997. Animal experiments on the Bion missions have contributed comprehensive data on adaptive responses of sensorimotor, cardiovascular, muscle, bone and other systems to spaceflight conditions and the mechanisms underlying these adaptations [1], [2].",
-        
-        "The use of mice for space experiments offers numerous advantages. Probably the most apparent one is their small size and thus the possibility of utilizing more animals per flight, thus increasing scientific output and the cost-efficiency ratio. Comparisons of data obtained with mice, with those obtained from larger species or humans can also reveal how factors affecting adaptation to spaceflight conditions depend on the size of the organism. The mouse has become the most prevalent 'mammalian model' in biomedical research, with a fully described genome and an established role in genetically engineered mutants. While mice are preferred mammalian models for molecular biology studies, their small size is a debated limitation rather than an advantage for physiological studies. Miniaturization of scientific hardware has reduced some of the disadvantages of the species small size. Finally, the use of genetically controlled mice offers a means to reduce inter-individual variability and obtain potentially more consistent results.",
-        
-        "Despite the advantages of the mouse as a model organism for space research, their use was rather limited (apart from a number of experiments with mice during early space exploration in the 1950's and 1960's, which were aimed primarily at testing if living organisms can survive the launch or a brief exposure in microgravity) [3]. Flight experiments with mice were performed aboard STS-90 ('NeuroLab'), STS-108, STS-129, STS-131 ('Mouse Immunology I'), STS-133 ('Mouse Immunology II'), and STS-135 with exposure times ranging from 12 to 16 days. Research programs of these flights were largely focused on studies of muscle, bone/tendon/cartilage, nervous, and cardiovascular systems, and innate and acquired immune responses. Experiments were performed with groups of 30 or fewer female C57BL/6J mice, which were dissected typically shortly after return [4]–[9].",
-        
-        "The Mice Drawer System (MDS) experiment of the Italian Space Agency is by far the longest spaceflight of mice to date [10]. In this mission, 6 mice were exposed for 91 days aboard the International Space Station. The advantages offered by the possibility of genetic manipulations with mice were utilized in this experiment; three mice were transgenic with pleiotrophin overexpression (C57BLJ10/ PTN) and three mice were their wild-type counterparts. The MDS habitats required periodic replenishment and servicing by by astronauts. Sadly, half of the mice died during the course of this mission due to various estimated reasons.",
-        
-        "In the present paper we aim to present a brief overview of the Bion-M 1 mission scientific goals and experimental design. Of particular interest we will focus on the program of mouse training and selection for the experiments, and some outcomes of the Bion-M 1 mission."
-    ]
-    
-    # Initialize embeddings
-    embedding_model = "sentence-transformers/all-MiniLM-L6-v2"
-    embeddings = HuggingFaceEmbeddings(model_name=embedding_model)
-    
-    # Create embeddings for text
-    text_vectors = embeddings.embed_documents(text)
-    
-    return text, embeddings, text_vectors
-
-def get_relevant_context(question, text, embeddings, text_vectors):
-    question_vector = embeddings.embed_query(question)
-    scores = cosine_similarity([question_vector], text_vectors)[0]
-    
-    # Get top 2 most relevant chunks
-    top_indices = np.argsort(scores)[-2:][::-1]
-    relevant_text = text[top_indices[0]] + "\n\n" + text[top_indices[1]]
-    
-    return relevant_text
-
-def generate_response(question, style, level, max_token, temperature):
+def generate_response(question, style, level, max_token, temperature, search_k, lambda_mult):
     try:
-        # Initialize RAG components
-        text, embeddings, text_vectors = initialize_rag()
+        vector_store = st.session_state.vector_store
         
-        # Get relevant context
-        relevant_context = get_relevant_context(question, text, embeddings, text_vectors)
+        # Get relevant context based on user level
+        if level == 'General':
+            result_docs = vector_store.similarity_search(question, k=search_k)
+        else:  # Researcher
+            result_docs = vector_store.mmr_search(question, k=search_k, lambda_mult=lambda_mult)
+        
+        content_only = [doc.page_content for doc in result_docs]
+        required_text_for_query = "\n".join(content_only)
         
         # Initialize LLM
-        model_name = "meta-llama/Llama-3.1-8B-Instruct"
-        llm = HuggingFaceEndpoint(
-            repo_id=model_name,
+        llm_final = HuggingFaceEndpoint(
+            repo_id="meta-llama/Llama-3.2-3B-Instruct",
             task="text-generation",
             temperature=temperature,
         )
-        model = ChatHuggingFace(llm=llm)
+        model = ChatHuggingFace(llm=llm_final)
         
-        # Create prompt
-        template_text = """
-        System : You are a biology rag chatbot, you will be given a context and a question from that context and you have to answer that question with {style}, and considering him as {level}
-        User :  Explain the following query -
-                {query} with {style} and assuming user to be {level}
-        Context regarding query: {required_text_for_query}
+        # Load chat history
+        chat = []
+        chat_file = Path('chat.txt')
+        if chat_file.exists():
+            with open(chat_file) as f:
+                chat.extend(f.readlines())
+        
+        # Create chat template
+        chat_template = ChatPromptTemplate([
+            ('system', """You are a biology rag chatbot, you will be given a context and a question from that context and you have to answer that question with {style}, and considering him as {level}.
+Only give answer the question when you are sure of it and it is present in Context somewhere.
+Also consider the max token limit to be {max_token}, do not go over this token limit.
 
-        Only give answer the question when you are sure of it and it is present in Context somewhere.
-        Also consider the max token limit to be {max_token},do not go over this token limit.
-        """
+Context regarding query:
+{required_text_for_query}
+
+Explain the following query - """),
+            MessagesPlaceholder(variable_name='chat'),
+            ('human', "{query} with {style} and assuming user to be {level}")
+        ])
         
-        prompt = PromptTemplate(
-            template=template_text,
-            input_variables=['query', 'style', 'level', 'max_token', 'required_text_for_query']
-        )
-        
-        template = prompt.invoke({
+        prompts = chat_template.invoke({
+            'chat': chat,
+            'required_text_for_query': required_text_for_query,
             'query': question,
             'style': style,
             'level': level,
-            'max_token': max_token,
-            'required_text_for_query': relevant_context,
+            'max_token': max_token
         })
         
-        result = model.invoke(template)
+        result = model.invoke(prompts)
+        
+        # Save to chat history
+        def append_message(result_content: str, query: str):
+            MAX_LINES = 10
+            DATA = Path("chat.txt")
+            COUNT = Path("chat.count")
+            
+            line_query = f'HumanMessage(content={{{query}}})\n'
+            line = f'AIMessage(content="{{{result_content}}}")\n'
+
+            if DATA.exists():
+                dq = deque(DATA.read_text(encoding="utf-8").splitlines(keepends=True), maxlen=MAX_LINES)
+            else:
+                dq = deque(maxlen=MAX_LINES)
+
+            dq.append(line_query)
+            dq.append(line)
+            DATA.write_text("".join(dq), encoding="utf-8")
+
+            total = int(COUNT.read_text()) if COUNT.exists() else 0
+            total += 2
+            COUNT.write_text(str(total))
+        
+        append_message(result.content, question)
         return result.content
         
     except Exception as e:
@@ -143,8 +430,8 @@ if st.session_state.rag_initialized:
         
         # Generate assistant response
         with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                response = generate_response(prompt, style, level, max_token, temperature)
+            with st.spinner("Searching knowledge base and generating response..."):
+                response = generate_response(prompt, style, level, max_token, temperature, search_k, lambda_mult)
                 st.markdown(response)
         
         # Add assistant response to chat history
@@ -153,6 +440,10 @@ if st.session_state.rag_initialized:
     # Clear chat button
     if st.button("Clear Chat"):
         st.session_state.messages = []
+        if Path("chat.txt").exists():
+            Path("chat.txt").unlink()
+        if Path("chat.count").exists():
+            Path("chat.count").unlink()
         st.rerun()
 
 else:
@@ -160,16 +451,20 @@ else:
     st.markdown("""
     ### Getting Started:
     1. Enter your Hugging Face API token in the sidebar
-    2. Configure your preferred settings
-    3. Click "Initialize RAG System"
+    2. Configure your preferred settings (user level determines search strategy)
+    3. Click "Initialize RAG System" 
     4. Start asking questions about space biology experiments!
     
+    ### User Levels:
+    - **General**: Uses similarity search for straightforward answers
+    - **Researcher**: Uses MMR search for diverse, comprehensive results
+    
     ### Example Questions:
-    - "What is the aim of the experiment?"
+    - "Give me Overview of the Bion-m 1 mission?"
     - "What animals were used in space research?"
     - "What are the advantages of using mice in space experiments?"
     """)
 
 # Footer
 st.markdown("---")
-st.markdown("Built with Streamlit and LangChain 🚀")
+st.markdown("Built with Streamlit, LangChain and pgvector 🚀")
