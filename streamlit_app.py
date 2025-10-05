@@ -5,12 +5,17 @@ from psycopg2.extras import execute_values, Json
 from psycopg2.extensions import register_adapter
 import hashlib
 from sentence_transformers import SentenceTransformer
-from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace
+from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace, HuggingFacePipeline
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain.schema import Document
+from langchain_core.retrievers import BaseRetriever
+from langchain_core.callbacks import CallbackManagerForRetrieverRun
+from langchain.retrievers.multi_query import MultiQueryRetriever
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
 import numpy as np
 from pathlib import Path
 from collections import deque
+from typing import List
 
 # Register dict to JSON adapter globally
 register_adapter(dict, Json)
@@ -37,6 +42,10 @@ if "rag_initialized" not in st.session_state:
 
 if "vector_store" not in st.session_state:
     st.session_state.vector_store = None
+
+if "t5_pipeline" not in st.session_state:
+    st.session_state.t5_pipeline = None
+
 
 class NeonVectorStore:
     """Persistent vector store using Neon PostgreSQL with pgvector"""
@@ -275,10 +284,39 @@ class NeonVectorStore:
         return [Document(page_content=candidates[i][1], metadata=candidates[i][2] or {})
                 for i in selected_indices]
 
+    def as_retriever(self, **kwargs):
+        """Create a LangChain-compatible retriever"""
+        return NeonRetriever(vector_store=self, **kwargs)
+
     def close(self):
         """Close database connection"""
         if self.conn:
             self.conn.close()
+
+
+class NeonRetriever(BaseRetriever):
+    """LangChain-compatible retriever wrapper for NeonVectorStore"""
+    
+    vector_store: NeonVectorStore
+    search_type: str = "similarity"
+    search_kwargs: dict = {}
+    
+    class Config:
+        arbitrary_types_allowed = True
+    
+    def _get_relevant_documents(
+        self, query: str, *, run_manager: CallbackManagerForRetrieverRun = None
+    ) -> List[Document]:
+        """Retrieve documents relevant to the query"""
+        k = self.search_kwargs.get("k", 4)
+        
+        if self.search_type == "mmr":
+            lambda_mult = self.search_kwargs.get("lambda_mult", 0.5)
+            fetch_k = self.search_kwargs.get("fetch_k", 20)
+            return self.vector_store.mmr_search(query, k=k, lambda_mult=lambda_mult, fetch_k=fetch_k)
+        else:
+            return self.vector_store.similarity_search(query, k=k)
+
 
 # Sidebar configuration
 with st.sidebar:
@@ -299,7 +337,24 @@ with st.sidebar:
             
             with st.spinner("Loading embedding model..."):
                 try:
+                    # Load embedding model
                     embedding_model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
+                    
+                    # Load T5 model for MultiQueryRetriever (only once)
+                    if st.session_state.t5_pipeline is None:
+                        with st.spinner("Loading T5 model for query generation..."):
+                            model_name_t5 = "google-t5/t5-small"
+                            tokenizer = AutoTokenizer.from_pretrained(model_name_t5)
+                            model_t5 = AutoModelForSeq2SeqLM.from_pretrained(model_name_t5)
+                            
+                            pipe = pipeline(
+                                "text2text-generation",
+                                model=model_t5,
+                                tokenizer=tokenizer,
+                                max_new_tokens=64,
+                                temperature=0.4
+                            )
+                            st.session_state.t5_pipeline = HuggingFacePipeline(pipeline=pipe)
                     
                     vector_store = NeonVectorStore(
                         connection_string=NEON_CONNECTION_STRING,
@@ -328,9 +383,11 @@ with st.sidebar:
         else:
             st.error("Please enter your Hugging Face token")
 
+
 # Main content
 st.title("🧬 Biology RAG Chatbot")
 st.markdown("Ask questions about space biology experiments!")
+
 
 def generate_response(question, style, level, max_token, temperature, search_k, lambda_mult):
     try:
@@ -338,16 +395,27 @@ def generate_response(question, style, level, max_token, temperature, search_k, 
         
         # Get relevant context based on user level
         if level == 'General':
-            result_docs = vector_store.similarity_search(question, k=search_k)
+            # Use MultiQueryRetriever for General users (students)
+            llm = st.session_state.t5_pipeline
+            
+            mqr = MultiQueryRetriever.from_llm(
+                retriever=vector_store.as_retriever(search_kwargs={"k": search_k}),
+                llm=llm,
+                include_original=True,
+            )
+            
+            result_docs = mqr.invoke(question)
+            content_only = [data.page_content for data in result_docs]
+            required_text_for_query = "\n".join(content_only)
+            
         else:  # Researcher
             result_docs = vector_store.mmr_search(question, k=search_k, lambda_mult=lambda_mult)
-        
-        content_only = [doc.page_content for doc in result_docs]
-        required_text_for_query = "\n".join(content_only)
+            content_only = [doc.page_content for doc in result_docs]
+            required_text_for_query = "\n".join(content_only)
         
         # Initialize LLM
         llm_final = HuggingFaceEndpoint(
-            repo_id="deepseek-ai/DeepSeek-V3.2-Exp",
+            repo_id="meta-llama/Llama-3.2-3B-Instruct",
             task="text-generation",
             temperature=temperature,
         )
@@ -413,6 +481,7 @@ Explain the following query - """),
     except Exception as e:
         return f"Error generating response: {str(e)}"
 
+
 # Chat interface
 if st.session_state.rag_initialized:
     # Display chat messages
@@ -456,7 +525,7 @@ else:
     4. Start asking questions about space biology experiments!
     
     ### User Levels:
-    - **General**: Uses similarity search for straightforward answers
+    - **General**: Uses MultiQueryRetriever for comprehensive answers (generates multiple query variations)
     - **Researcher**: Uses MMR search for diverse, comprehensive results
     
     ### Example Questions:
@@ -468,5 +537,4 @@ else:
 # Footer
 st.markdown("---")
 st.markdown("Built with Streamlit, LangChain and pgvector 🚀")
-
 
