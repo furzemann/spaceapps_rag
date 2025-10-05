@@ -8,4 +8,5 @@ numpy
 pathlib
 requests
 pandas
+torch
 beautifulsoup4
