@@ -12,8 +12,7 @@ import hashlib
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 # Neon connection string
-DATABASE_URL = "postgresql://neondb_owner:npg_cZJvwbxs23YS@ep-flat-term-a1bhljd0-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
-
+DATABASE_URL = "YOUR_DATABASE_URL"
 def fix_database_schema():
     try:
         conn = psycopg2.connect(DATABASE_URL)
@@ -535,4 +534,5 @@ if __name__ == "__main__":
     for result in results:
         print(f"Paper: {result['pmc_id']} - {result['section_type']}")
         print(f"Text: {result['chunk_text'][:200]}...")
+
         print("---")
