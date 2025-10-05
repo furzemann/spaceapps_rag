@@ -347,7 +347,7 @@ def generate_response(question, style, level, max_token, temperature, search_k, 
         
         # Initialize LLM
         llm_final = HuggingFaceEndpoint(
-            repo_id="meta-llama/Llama-3.2-3B-Instruct",
+            repo_id="deepseek-ai/DeepSeek-V3.2-Exp",
             task="text-generation",
             temperature=temperature,
         )
@@ -468,4 +468,5 @@ else:
 # Footer
 st.markdown("---")
 st.markdown("Built with Streamlit, LangChain and pgvector 🚀")
+
 
